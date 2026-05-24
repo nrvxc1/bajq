@@ -1,4 +1,4 @@
-# ultimate_bot_safe.py - МАКСИМАЛЬНО ЧИСТЫЙ МЕТОД
+# ultimate_bot_safe.py
 import asyncio
 import sqlite3
 import time
@@ -9,12 +9,11 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from telethon import TelegramClient
-from telethon.tl.functions.messages import SearchGlobalRequest
-from telethon.tl.functions.contacts import ResolveUsernameRequest
-from telethon.errors import FloodWaitError, UsernameNotOccupiedError
-from telethon.sessions import StringSession
-from telethon.network.connection.tcpabridged import ConnectionTcpAbridged
+from pyrogram import Client
+from pyrogram.raw.functions.messages import SearchGlobal
+from pyrogram.raw.functions.contacts import ResolveUsername
+from pyrogram.raw.types import InputPeerEmpty
+from pyrogram.errors import FloodWait, UsernameNotOccupied
 import threading
 
 BOT_TOKEN = "8456845056:AAFj2uy9sDeM4fboiMMJ_4ac3nS3EAM3Q6w"
@@ -78,21 +77,8 @@ init_databases()
 class States(StatesGroup):
     waiting_api_id = State()
     waiting_api_hash = State()
-    waiting_phone = State()
     waiting_session = State()
     waiting_message = State()
-
-def create_client(api_id, api_hash, session_string=""):
-    return TelegramClient(
-        StringSession(session_string),
-        api_id,
-        api_hash,
-        connection=ConnectionTcpAbridged,
-        use_ipv6=False,
-        system_version="4.16.30-vxCUSTOM",
-        device_model="Pixel 8 Pro",
-        app_version="10.15.0"
-    )
 
 class DistributedMiner:
     def __init__(self, account_id, api_id, api_hash, session_string):
@@ -103,7 +89,13 @@ class DistributedMiner:
         self.total_found = 0
         
     async def run_mining(self):
-        client = create_client(self.api_id, self.api_hash, self.session_string)
+        client = Client(
+            f"miner_{self.account_id}",
+            api_id=self.api_id,
+            api_hash=self.api_hash,
+            session_string=self.session_string,
+            in_memory=True
+        )
         
         try:
             await client.start()
@@ -120,10 +112,9 @@ class DistributedMiner:
         
         # Сбор диалогов
         try:
-            dialogs = await client.get_dialogs(limit=500)
-            for dialog in dialogs:
-                if dialog.is_group or dialog.is_channel:
-                    chat = dialog.entity
+            async for dialog in client.get_dialogs(limit=500):
+                chat = dialog.chat
+                if chat and chat.type in ["group", "supergroup", "channel"]:
                     with db_lock:
                         conn = sqlite3.connect("million_chats.db")
                         cursor = conn.cursor()
@@ -133,18 +124,19 @@ class DistributedMiner:
                         """, (
                             chat.id,
                             getattr(chat, 'username', ''),
-                            dialog.name,
-                            getattr(chat, 'participants_count', 0),
-                            'channel' if dialog.is_channel else 'group',
+                            getattr(chat, 'title', ''),
+                            getattr(chat, 'members_count', 0),
+                            str(chat.type),
                             f'dialogs_{self.account_id}'
                         ))
                         cursor.execute("""
                         INSERT OR IGNORE INTO group_queue (chat_id, members_count, priority)
                         VALUES (?, ?, ?)
-                        """, (chat.id, getattr(chat, 'participants_count', 0), 3))
+                        """, (chat.id, getattr(chat, 'members_count', 0), 3))
                         conn.commit()
                         conn.close()
                         self.total_found += 1
+                await asyncio.sleep(0.1)
         except Exception as e:
             print(f"[Miner {self.account_id}] Ошибка диалогов: {e}")
         
@@ -157,11 +149,18 @@ class DistributedMiner:
         
         for query in search_queries:
             try:
-                result = await client(SearchGlobalRequest(
-                    q=query, filter=None, min_date=None, max_date=None,
-                    offset_rate=0, offset_peer=types.InputPeerEmpty(),
-                    offset_id=0, limit=200
-                ))
+                result = await client.invoke(
+                    SearchGlobal(
+                        q=query,
+                        filter=None,
+                        min_date=0,
+                        max_date=0,
+                        offset_rate=0,
+                        offset_peer=InputPeerEmpty(),
+                        offset_id=0,
+                        limit=200
+                    )
+                )
                 for chat in result.chats:
                     with db_lock:
                         conn = sqlite3.connect("million_chats.db")
@@ -181,43 +180,10 @@ class DistributedMiner:
                         conn.close()
                         self.total_found += 1
                 await asyncio.sleep(0.5)
-            except FloodWaitError as e:
-                await asyncio.sleep(e.seconds)
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
             except:
                 continue
-        
-        # Брутфорс юзернеймов
-        base_words = ["chat", "group", "news", "bot", "free", "pro", "top", "club"]
-        for word in base_words:
-            for i in range(self.account_id * 100, (self.account_id + 1) * 100):
-                username = f"{word}{i}"
-                try:
-                    result = await client(ResolveUsernameRequest(username))
-                    for chat in result.chats:
-                        with db_lock:
-                            conn = sqlite3.connect("million_chats.db")
-                            cursor = conn.cursor()
-                            cursor.execute("""
-                            INSERT OR IGNORE INTO mega_chats (chat_id, username, title, members_count, type, source)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                            """, (
-                                chat.id,
-                                getattr(chat, 'username', ''),
-                                getattr(chat, 'title', ''),
-                                getattr(chat, 'participants_count', 0),
-                                'channel',
-                                f'username_{self.account_id}'
-                            ))
-                            conn.commit()
-                            conn.close()
-                            self.total_found += 1
-                    await asyncio.sleep(0.05)
-                except UsernameNotOccupiedError:
-                    continue
-                except FloodWaitError as e:
-                    await asyncio.sleep(e.seconds)
-                except:
-                    continue
         
         # Выкачка участников из групп
         with db_lock:
@@ -229,12 +195,16 @@ class DistributedMiner:
         
         for (chat_id,) in groups:
             try:
-                participants = await client.get_participants(chat_id, limit=5000)
+                participants = []
+                async for member in client.get_chat_members(chat_id, limit=5000):
+                    participants.append(member)
+                
                 with db_lock:
                     conn = sqlite3.connect("million_chats.db")
                     cursor = conn.cursor()
-                    for user in participants:
-                        if not user.bot:
+                    for member in participants:
+                        user = member.user
+                        if user and not user.is_bot:
                             cursor.execute("""
                             INSERT OR REPLACE INTO users_network (user_id, username, first_name, last_name, is_bot)
                             VALUES (?, ?, ?, ?, ?)
@@ -250,11 +220,13 @@ class DistributedMiner:
                     conn.commit()
                     conn.close()
                 await asyncio.sleep(1)
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
             except:
                 continue
         
         print(f"[Miner {self.account_id}] ЗАВЕРШЁН: +{self.total_found}")
-        await client.disconnect()
+        await client.stop()
         return self.total_found
 
 class MiningCoordinator:
@@ -291,39 +263,23 @@ class MiningCoordinator:
 
 coordinator = MiningCoordinator()
 
-# Генератор скрипта для получения сессии
 def generate_session_script(api_id, api_hash):
     return f"""
-import asyncio
-from telethon import TelegramClient
-from telethon.sessions import StringSession
-from telethon.network.connection.tcpabridged import ConnectionTcpAbridged
+from pyrogram import Client
 
 api_id = {api_id}
 api_hash = "{api_hash}"
 
-async def main():
-    client = TelegramClient(
-        StringSession(),
-        api_id,
-        api_hash,
-        connection=ConnectionTcpAbridged,
-        use_ipv6=False,
-        system_version="4.16.30-vxCUSTOM",
-        device_model="Pixel 8 Pro",
-        app_version="10.15.0"
-    )
-    
-    await client.start()
-    session_string = StringSession.save(client.session)
-    print("\\n" + "="*50)
-    print("ТВОЯ СЕССИЯ:")
-    print(session_string)
-    print("="*50)
-    print("\\nОтправь эту строку боту командой /session СТРОКА")
-    await client.disconnect()
+client = Client("my_account", api_id=api_id, api_hash=api_hash)
+client.start()
 
-asyncio.run(main())
+session_string = client.export_session_string()
+print("\\n" + "="*50)
+print("ТВОЯ СЕССИЯ:")
+print(session_string)
+print("="*50)
+print("\\nОтправь эту строку боту командой /session СТРОКА")
+client.stop()
 """
 
 @dp.message(Command("start"))
@@ -353,18 +309,16 @@ async def add_api(message: types.Message, state: FSMContext):
     
     await state.update_data(api_id=api_id, api_hash=api_hash)
     
-    # Генерируем скрипт для пользователя
     script = generate_session_script(api_id, api_hash)
     
-    # Сохраняем скрипт
     filename = f"get_session_{message.from_user.id}.py"
     with open(filename, 'w', encoding='utf-8') as f:
         f.write(script)
     
     await message.answer(
         "Теперь тебе нужно получить сессию:\n\n"
-        "1. Установи Python и Telethon:\n"
-        "`pip install telethon`\n\n"
+        "1. Установи pyrogram:\n"
+        "`pip install pyrogram tgcrypto`\n\n"
         "2. Запусти скрипт который я отправил ниже\n\n"
         "3. Введи номер телефона и код из Telegram\n\n"
         "4. Скопируй строку сессии\n\n"
@@ -372,10 +326,9 @@ async def add_api(message: types.Message, state: FSMContext):
         "/session СТРОКА_СЕССИИ"
     )
     
-    # Отправляем скрипт
     await message.answer_document(
         types.FSInputFile(filename),
-        caption="Запусти этот скрипт у себя на компьютере"
+        caption="Запусти этот скрипт у себя"
     )
     
     os.remove(filename)
@@ -398,20 +351,19 @@ async def add_session(message: types.Message, state: FSMContext):
         await message.answer("Сначала отправь api_id и api_hash через /add_api")
         return
     
-    # Проверяем сессию
-    client = create_client(api_id, api_hash, session_string)
+    client = Client(
+        "checker",
+        api_id=api_id,
+        api_hash=api_hash,
+        session_string=session_string,
+        in_memory=True
+    )
     
     try:
-        await client.connect()
-        if not await client.is_user_authorized():
-            await message.answer("Сессия невалидна. Получи новую.")
-            await client.disconnect()
-            return
-        
+        await client.start()
         me = await client.get_me()
-        phone = getattr(me, 'phone', 'Неизвестно')
+        phone = getattr(me, 'phone_number', 'Неизвестно')
         
-        # Сохраняем в базу
         with db_lock:
             conn = sqlite3.connect("bot_users.db")
             cursor = conn.cursor()
@@ -422,9 +374,8 @@ async def add_session(message: types.Message, state: FSMContext):
             conn.commit()
             conn.close()
         
-        await client.disconnect()
+        await client.stop()
         
-        # Запускаем майнинг
         await coordinator.start_mining(message.from_user.id, api_id, api_hash, session_string)
         
         await message.answer(
@@ -437,7 +388,10 @@ async def add_session(message: types.Message, state: FSMContext):
         
     except Exception as e:
         await message.answer(f"Ошибка проверки сессии: {e}")
-        await client.disconnect()
+        try:
+            await client.stop()
+        except:
+            pass
 
 @dp.message(Command("stats"))
 async def stats(message: types.Message):
@@ -488,7 +442,13 @@ async def broadcast_send(message: types.Message, state: FSMContext):
     
     async def send_from_account(account, chat_list, msg_text):
         api_id, api_hash, session = account
-        client = create_client(api_id, api_hash, session)
+        client = Client(
+            f"broadcast_{api_id}",
+            api_id=api_id,
+            api_hash=api_hash,
+            session_string=session,
+            in_memory=True
+        )
         
         try:
             await client.start()
@@ -500,7 +460,7 @@ async def broadcast_send(message: types.Message, state: FSMContext):
                     await asyncio.sleep(1.5)
                 except:
                     continue
-            await client.disconnect()
+            await client.stop()
             return sent
         except:
             return 0
@@ -517,7 +477,6 @@ async def broadcast_send(message: types.Message, state: FSMContext):
     await state.clear()
 
 async def main():
-    # Автозапуск сохранённых аккаунтов
     with db_lock:
         conn = sqlite3.connect("bot_users.db")
         cursor = conn.cursor()
